@@ -26,7 +26,7 @@ public class BiliLiveConfig
 }
 
 [Module("B站直播查询",
-    "B站直播分区与在线人气榜：大区与子分区列表、按名称查分区、某大区/子分区的在线人气前N、各大区人气一览",
+    "B站直播分区与在线人气榜：大区与子分区列表、按名称查分区、某大区/子分区的在线人气前N、各大区人气一览、某个房间或主播现在在不在播",
     defaultCategory: "苏染的工具")]
 public class BiliLiveModule(
     XmlFunctionCaller functionCaller,
@@ -40,8 +40,12 @@ public class BiliLiveModule(
     const string LiveApiBase = "https://api.live.bilibili.com";
     const string AreaListPath = "/room/v1/Area/getList?parent_id=0";
     const string RoomListPath = "/room/v1/Area/getRoomList";
+    const string RoomListV3Path = "/room/v3/area/getRoomList";
+    const string RoomInfoPath = "/room/v1/Room/get_info?room_id=";
+    const string MasterInfoPath = "/live_user/v1/Master/info?uid=";
     const string BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
     const int AreaCacheSeconds = 1800;
+    const int KeywordScanSize = 50;
 
     List<LiveParentArea> parentAreas = new();
     List<LiveSubArea> subAreas = new();
@@ -51,10 +55,11 @@ public class BiliLiveModule(
     {
         XmlHandler handler = new(this)
         {
-            Description = "B站直播分区与人气榜查询：大区/子分区列表、指定分区在线人气前N、各大区人气一览。",
+            Description = "B站直播分区与人气榜查询：大区/子分区列表、指定分区在线人气前N、各大区人气一览、单个房间/主播在不在播。",
             Explanation = "全部走B站直播公开接口，无需登录、无需Cookie。人气是实时的在线人气，每次查都会变。"
                 + "分区既可以用ID也可以用中文名（如 BiliLiveRank(\"单机游戏\") 或 BiliLiveRank(area:\"英雄联盟\")），"
                 + "记不住分区时先用 BiliLiveAreas 带关键词查。"
+                + "问「XX现在在播吗/这个直播间什么状态」用 BiliLiveRoom，房间号在 https://live.bilibili.com/ 地址栏里能看到。"
         };
         functionCaller.RegisterHandler(handler, DocumentMode.Implicit, cancellationToken: DestroyCancellationToken);
         return Task.CompletedTask;
@@ -115,20 +120,24 @@ public class BiliLiveModule(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("查某大区或子分区的在线人气榜前N。参数可填ID也可填中文名；只给子分区名时会自动定位它所属的大区；两者都留空表示全站热门")]
+    [Description("查某大区或子分区的在线人气榜前N。参数可填ID也可填中文名；只给子分区名时会自动定位它所属的大区；两者都留空表示全站热门。sort留空/online=人气最高优先（接口自带的排序到第25条之后会抖，插件拿回来再按人气本地重排一次），new=最新开播优先（实测这个模式回的房间人气多为0，按接口顺序列、不重排）")]
     public async Task BiliLiveRank(
         [Description("大区ID或大区名，如 6 / 单机游戏；0 或留空表示全站")] string? parentArea = null,
         [Description("子分区ID或名称，如 236 / 主机游戏；0 或留空表示整个大区")] string? area = null,
-        [Description("榜单条数，默认10，上限看插件配置")] int count = 10)
+        [Description("榜单条数，默认10，上限看插件配置")] int count = 10,
+        [Description("排序：留空或 online=按人气从多到少，new=最新开播")] string? sort = null)
     {
         (string parentId, string areaId, string label) = await ResolveAreaAsync(parentArea ?? "", area ?? "");
         int limited = Math.Clamp(count, 1, Math.Clamp(Configuration.MaxCount, 1, 50));
+        bool newestFirst = IsNewestSort(sort);
         string url = LiveApiBase + RoomListPath
-            + "?parent_area_id=" + parentId + "&area_id=" + areaId + "&sort_type=online&page=1&page_size=" + limited;
+            + "?parent_area_id=" + parentId + "&area_id=" + areaId + "&sort_type=" + (newestFirst ? "live_time" : "online")
+            + "&page=1&page_size=" + limited;
         JsonElement data = await LiveGetAsync(url);
         List<string> lines = new();
-        lines.Add("【" + label + "】在线人气榜 前" + limited + "（实时数据，随时间变化）");
-        List<JsonElement> rooms = FlattenArray(data);
+        lines.Add("【" + label + "】" + (newestFirst ? "最新开播" : "在线人气") + " 前" + limited
+            + (newestFirst ? "" : "（已按人气本地重排）") + "（实时数据，随时间变化）");
+        List<JsonElement> rooms = newestFirst ? FlattenArray(data) : SortByOnline(FlattenArray(data));
         if (rooms.Count == 0)
         {
             lines.Add("（该分区当前没有返回房间，可能是暂时没人在播或接口限流，可稍后再试或换个大区）");
@@ -148,6 +157,12 @@ public class BiliLiveModule(
         interactor.Poke(string.Join("\n", lines));
     }
 
+    static bool IsNewestSort(string? sort)
+    {
+        string want = (sort ?? "").Trim().ToLowerInvariant();
+        return want == "new" || want == "live_time" || want == "最新" || want == "开播";
+    }
+
     [XmlFunction(FunctionMode.OneShot)]
     [Description("一次给出所有大区各自的在线人气前N，用来看哪个区人多；子分区请看 BiliLiveRank")]
     public async Task BiliLiveOverview(
@@ -156,7 +171,7 @@ public class BiliLiveModule(
         await LoadAreaTreeAsync();
         int limited = Math.Clamp(count, 1, Math.Clamp(Configuration.MaxCount, 1, 50));
         List<string> lines = new();
-        lines.Add("B站直播各大区在线人气前" + limited + "（实时数据）");
+        lines.Add("B站直播各大区在线人气前" + limited + "（实时数据，每个区内部已按人气本地重排）");
         foreach (LiveParentArea parent in parentAreas)
         {
             lines.Add("");
@@ -164,7 +179,7 @@ public class BiliLiveModule(
                 + "?parent_area_id=" + parent.Id + "&area_id=0&sort_type=online&page=1&page_size=" + limited;
             try
             {
-                List<JsonElement> rooms = FlattenArray(await LiveGetAsync(url));
+                List<JsonElement> rooms = SortByOnline(FlattenArray(await LiveGetAsync(url)));
                 if (rooms.Count == 0)
                 {
                     lines.Add("【" + parent.Name + "】当前没有返回房间");
@@ -186,6 +201,186 @@ public class BiliLiveModule(
         }
         interactor.Poke(string.Join("\n", lines));
     }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("查某个直播间现在在不在播、标题与人气。source 可给房间号（长号或短号都认，实测短号6能跳到 7734200）、直播间链接、主播UID（配 asUid=true），也可给主播昵称——昵称是拿B站直播关键词搜一页再按昵称筛，只筛得到正在播的")]
+    public async Task BiliLiveRoom(
+        [Description("房间号、直播间链接、主播UID 或主播昵称")] string source,
+        [Description("source 给的是主播UID就填 true，默认按房间号认")] bool asUid = false)
+    {
+        string trimmed = source.Trim();
+        if (trimmed.Length == 0)
+        {
+            throw new Exception("没给房间号、UID或主播名");
+        }
+        Match linkMatch = Regex.Match(trimmed, @"live\.bilibili\.com/(?:h/)?(\d+)", RegexOptions.IgnoreCase);
+        if (linkMatch.Success)
+        {
+            trimmed = linkMatch.Groups[1].Value;
+        }
+
+        if (IsDigits(trimmed) == false)
+        {
+            await ReportByNameAsync(trimmed);
+            return;
+        }
+        string roomArg = trimmed;
+        List<string> notes = new();
+        JsonElement? info;
+        string anchor = "";
+        if (asUid)
+        {
+            (info, string uidError, anchor) = await ResolveByUidAsync(roomArg);
+            if (info == null)
+            {
+                throw new Exception("UID " + roomArg + " 没查到直播间：" + uidError);
+            }
+            notes.Add("（按主播UID " + source.Trim() + " 定位到房间）");
+        }
+        else
+        {
+            (info, string roomError) = await FetchAsync(RoomInfoUrl(roomArg));
+            if (info == null)
+            {
+                // 这串数字既可能是房间号也可能是UID，两种都试一遍，并把试的顺序说清楚
+                (JsonElement? byUid, string uidError, string uidAnchor) = await ResolveByUidAsync(roomArg);
+                if (byUid == null)
+                {
+                    throw new Exception("房间 " + roomArg + " 查不到（" + roomError + "），当主播UID试也不通（" + uidError + "）；"
+                        + "房间号可在 https://live.bilibili.com/ 地址栏里看到");
+                }
+                notes.Add("（" + roomArg + " 当房间号查不到：" + roomError + "；改按主播UID查到了房间 " + S(byUid.Value, "room_id") + "）");
+                info = byUid;
+                anchor = uidAnchor;
+            }
+        }
+        if (anchor.Length == 0)
+        {
+            anchor = await AnchorNameAsync(S(info.Value, "uid"));
+        }
+        List<string> lines = new();
+        lines.AddRange(notes);
+        lines.Add(DescribeRoomLine(info.Value, anchor));
+        interactor.Poke(string.Join("\n", lines));
+    }
+
+    static string RoomInfoUrl(string roomId) => LiveApiBase + RoomInfoPath + roomId;
+
+    static string MasterInfoUrl(string uid) => LiveApiBase + MasterInfoPath + uid;
+
+    // 主播名没有直接查房间的免登录接口：拿 v3 的 keyWord 搜一页，再按昵称筛（实测「青铜树海」「迷瞪」都能在50条里筛到那一条，
+    // 而接口回的 count 是整个分区的热度计数、不是命中数，所以不能拿它当「搜到几条」）
+    static string KeywordSearchUrl(string keyword, int size) => LiveApiBase + RoomListV3Path
+        + "?platform=web&parent_area_id=0&cate_id=0&area_id=0&sort_type=online&page=1&page_size=" + size
+        + "&keyWord=" + Uri.EscapeDataString(keyword);
+
+    static List<JsonElement> FilterByUname(List<JsonElement> rooms, string name) =>
+        rooms.FindAll(room => S(room, "uname").IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0);
+
+    // v3 这个接口把房间放在 data.list 里（榜单那个 v1 接口是直接给数组），两种形状都要认
+    async Task<List<JsonElement>> KeywordRoomsAsync(string name)
+    {
+        JsonElement payload = await LiveGetAsync(KeywordSearchUrl(name, KeywordScanSize));
+        return payload.TryGetProperty("list", out JsonElement list) ? FlattenArray(list) : FlattenArray(payload);
+    }
+
+    async Task ReportByNameAsync(string name)
+    {
+        List<JsonElement> rooms = await KeywordRoomsAsync(name);
+        List<JsonElement> hits = FilterByUname(rooms, name);
+        if (hits.Count == 0)
+        {
+            throw new Exception("直播关键词搜「" + name + "」这一页 " + rooms.Count + " 条里没有昵称含这个词的主播；"
+                + "B站这个搜索是按标题/标签模糊匹配的，给房间号最准（或 asUid=true 配UID）");
+        }
+        if (hits.Count > 1)
+        {
+            List<string> names = hits.ConvertAll(room => S(room, "uname") + "（房间 " + S(room, "roomid") + "，人气 " + FormatOnline(N(room, "online")) + "）");
+            int shown = Math.Min(8, names.Count);
+            throw new Exception("昵称含「" + name + "」的在播主播有 " + hits.Count + " 个，请指明其一："
+                + string.Join("、", names.GetRange(0, shown)) + (shown < names.Count ? "…" : ""));
+        }
+        JsonElement? info = (await FetchAsync(RoomInfoUrl(S(hits[0], "roomid")))).Data ?? hits[0];
+        interactor.Poke("主播「" + name + "」：" + DescribeRoomLine(info.Value, S(hits[0], "uname"))
+            + "\n（按直播关键词搜到这一条，榜上人气 " + FormatOnline(N(hits[0], "online")) + "）");
+    }
+
+    async Task<(JsonElement? Data, string Error)> FetchAsync(string url)
+    {
+        try
+        {
+            return (await LiveGetAsync(url), "");
+        }
+        catch (Exception fetchError)
+        {
+            return (null, fetchError.Message);
+        }
+    }
+
+    async Task<(JsonElement? RoomInfo, string Error, string AnchorName)> ResolveByUidAsync(string uid)
+    {
+        (JsonElement? master, string masterError) = await FetchAsync(MasterInfoUrl(uid));
+        if (master == null)
+        {
+            return (null, masterError, "");
+        }
+        string roomId = S(master.Value, "room_id");
+        if (roomId.Length == 0 || roomId == "0")
+        {
+            return (null, "这个UID没有直播间", "");
+        }
+        (JsonElement? info, string error) = await FetchAsync(RoomInfoUrl(roomId));
+        return (info, error, MasterName(master.Value));
+    }
+
+    // 主播昵称在 Master/info 的 data.info.uname 里，get_info 本身不给昵称
+    static string MasterName(JsonElement master) =>
+        master.TryGetProperty("info", out JsonElement inner) && inner.ValueKind == JsonValueKind.Object ? S(inner, "uname") : "";
+
+    async Task<string> AnchorNameAsync(string uid)
+    {
+        if (uid.Length == 0)
+        {
+            return "";
+        }
+        var fetched = await FetchAsync(MasterInfoUrl(uid));
+        return fetched.Data == null ? "" : MasterName(fetched.Data.Value);
+    }
+
+    string DescribeRoomLine(JsonElement info, string anchor)
+    {
+        long status = N(info, "live_status");
+        string state = status switch
+        {
+            1 => "直播中",
+            2 => "轮播/回放（实测这种 online 为0、live_time 是 0000-00-00 占位）",
+            0 => "没在播",
+            _ => "状态码 " + status
+        };
+        string roomId = S(info, "room_id");
+        List<string> parts = new()
+        {
+            "直播间 " + roomId + (S(info, "short_id") is string shortId && shortId.Length > 0 && shortId != "0" ? "（短号 " + shortId + "）" : "")
+                + " https://live.bilibili.com/" + roomId,
+            "　" + state + " · 人气 " + FormatOnline(N(info, "online"))
+                + " · 关注 " + FormatOnline(N(info, "attention"))
+                + "（实测 attention 与主播资料的 follower_num 同值）"
+        };
+        parts.Add("　主播 " + (anchor.Length > 0 ? anchor : "（昵称没取到）")
+            + (S(info, "uid").Length > 0 ? "（uid " + S(info, "uid") + "）" : "")
+            + " · 分区 " + S(info, "parent_area_name") + "/" + S(info, "area_name"));
+        if (S(info, "title").Length > 0)
+        {
+            parts.Add("　标题：" + OneLine(S(info, "title")));
+        }
+        if (S(info, "live_time").Length > 0 && S(info, "live_time").StartsWith("0000") == false)
+        {
+            parts.Add("　开播时间：" + S(info, "live_time"));
+        }
+        return string.Join("\n", parts);
+    }
+
+    static bool IsDigits(string text) => Regex.IsMatch(text, @"^\d+$");
 
     // ============================================================
     // 分区树与参数解析
@@ -238,7 +433,15 @@ public class BiliLiveModule(
                 || p.Name.Contains(parentArg, StringComparison.OrdinalIgnoreCase));
             if (namedParent == null)
             {
-                throw new Exception("没有名为「" + parentArg + "」的直播大区，先用 BiliLiveAreas 看大区列表");
+                // 只给一个数字时很容易把子分区ID填进 parentArea（236 这类），认出来就直接按子分区查
+                LiveSubArea? mistaken = areaArg.Length == 0 || IsSiteArg(areaArg) ? subAreas.Find(s => s.Id == parentArg) : null;
+                if (mistaken != null)
+                {
+                    return (mistaken.ParentId, mistaken.Id,
+                        mistaken.ParentName + "/" + mistaken.Name + "（" + parentArg + " 是子分区ID，已按子分区查）");
+                }
+                throw new Exception("没有名为「" + parentArg + "」的直播大区，先用 BiliLiveAreas 看大区列表"
+                    + (subAreas.Exists(s => s.Id == parentArg) ? "；" + parentArg + " 是子分区ID，要填到 area 参数里" : ""));
             }
         }
 
@@ -324,6 +527,14 @@ public class BiliLiveModule(
             : online.ToString(CultureInfo.InvariantCulture);
 
     static string OneLine(string text) => Regex.Replace(text, "\\s+", " ").Trim();
+
+    // 接口自带的 sort_type=online 到第25条之后会抖（实测一次取50条里有33个逆序对），拿回来自己按人气重排
+    static List<JsonElement> SortByOnline(List<JsonElement> rooms)
+    {
+        List<JsonElement> sorted = new(rooms);
+        sorted.Sort((left, right) => N(right, "online").CompareTo(N(left, "online")));
+        return sorted;
+    }
 
     static List<JsonElement> FlattenArray(JsonElement element)
     {
